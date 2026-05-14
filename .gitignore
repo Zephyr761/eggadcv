@@ -1,0 +1,29 @@
+# ===== Custom project dirs =====
+output/
+/externals
+
+# ===== Python cache/bytecode =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ===== Virtual envs =====
+.venv/
+venv/
+env/
+
+# ===== Logs & temp =====
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== Build artifacts =====
+build/
+dist/
+*.egg-info/
