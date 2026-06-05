@@ -500,6 +500,57 @@ class NuScenesSceneFolderDataset(Dataset):
     def __len__(self):
         return len(self.sample_index)
 
+    def _camera_to_local_ego(self, camera_to_world: torch.Tensor) -> torch.Tensor:
+        """Convert exported camera-to-world matrices to a local ego rig frame.
+
+        The scene-folder export stores ``w2c`` in a global/world frame. The VAE
+        projector expects camera-to-ego matrices whose origin is near the
+        camera rig. We approximate the per-frame ego frame from the camera ring:
+
+        - origin: mean camera center;
+        - +x: CAM_FRONT optical axis projected to the ground plane;
+        - +z: world up;
+        - +y: left axis completing a right-handed frame.
+
+        This keeps the canonical cylinder ego-centric instead of accidentally
+        placing it at the global map origin.
+        """
+        if camera_to_world.ndim != 4:
+            raise ValueError(
+                "camera_to_world must have shape [T,V,4,4], got "
+                f"{tuple(camera_to_world.shape)}")
+        t_len, v_count = camera_to_world.shape[:2]
+        out = camera_to_world.clone()
+        front_idx = (
+            self.sensor_channels.index("CAM_FRONT")
+            if "CAM_FRONT" in self.sensor_channels else min(1, v_count - 1)
+        )
+        world_up = torch.tensor(
+            [0.0, 0.0, 1.0], dtype=camera_to_world.dtype,
+            device=camera_to_world.device)
+
+        for t in range(t_len):
+            centers = camera_to_world[t, :, :3, 3]
+            origin = centers.mean(dim=0)
+            front = camera_to_world[t, front_idx, :3, 2]
+            front_xy = torch.stack([front[0], front[1], front.new_zeros(())])
+            if float(front_xy.norm()) < 1e-6:
+                front_xy = torch.tensor(
+                    [1.0, 0.0, 0.0], dtype=front.dtype, device=front.device)
+            x_axis = front_xy / front_xy.norm().clamp(min=1e-6)
+            y_axis = torch.cross(world_up, x_axis, dim=0)
+            y_axis = y_axis / y_axis.norm().clamp(min=1e-6)
+            z_axis = world_up
+            local_to_world = torch.stack([x_axis, y_axis, z_axis], dim=1)
+            world_to_local = local_to_world.t()
+
+            out[t, :, :3, :3] = torch.einsum(
+                "ij,vjk->vik", world_to_local, camera_to_world[t, :, :3, :3])
+            out[t, :, :3, 3] = torch.einsum(
+                "ij,vj->vi", world_to_local, centers - origin)
+            out[t, :, 3, :] = camera_to_world[t, :, 3, :]
+        return out
+
     def __getitem__(self, idx):
         scene_idx, start = self.sample_index[idx]
         scene = self.scenes[scene_idx]
@@ -531,11 +582,16 @@ class NuScenesSceneFolderDataset(Dataset):
             E_list.append(torch.stack(frame_E, dim=0))
             image_size.append(torch.stack(frame_size, dim=0))
 
+        K = torch.stack(K_list, dim=0)
+        E_world = torch.stack(E_list, dim=0)
+        E_local = self._camera_to_local_ego(E_world)
+        sizes = torch.stack(image_size, dim=0)
+
         return {
             "images": images,
-            "camera_intrinsics": torch.stack(K_list, dim=0),
-            "camera_transforms": torch.stack(E_list, dim=0),
-            "image_size": torch.stack(image_size, dim=0),
+            "camera_intrinsics": K,
+            "camera_transforms": E_local,
+            "image_size": sizes,
         }
 
 

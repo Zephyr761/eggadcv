@@ -15,9 +15,9 @@ pass ``--text-only``.
 Usage examples
 --------------
 
-python -m zhw_vae_510.plot_training --run zhw_vae_510/runs/nusc_scene_bs1x8_bc64
-python -m zhw_vae_510.plot_training --metrics zhw_vae_510/runs/metrics.jsonl
-python -m zhw_vae_510.plot_training --run zhw_vae_510/runs --text-only
+python -m step_1.plot_training --run step_1/runs/nusc_scene_bs1x8_bc64
+python -m step_1.plot_training --metrics step_1/runs/metrics.jsonl
+python -m step_1.plot_training --run step_1/runs --text-only
 """
 from __future__ import annotations
 
@@ -365,7 +365,7 @@ def main():
         metrics_path = Path(args.metrics)
         run_dir = metrics_path.parent
     else:
-        run_dir = Path(args.run or "zhw_vae_510/runs")
+        run_dir = Path(args.run or "cylinder_vae/runs")
         metrics_path = run_dir / "metrics.jsonl"
 
     rows = load_rows(metrics_path)

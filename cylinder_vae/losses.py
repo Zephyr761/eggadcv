@@ -12,9 +12,9 @@ Three components:
    via LPIPS for sharper textures (skipped if ``lpips`` is not installed).
 
 2. **KL divergence**: standard analytic KL of the Gaussian posterior against
-   ``N(0, I)``, summed over latent elements then averaged across batch.
-   Scaled by a small ``kl_weight`` (think 1e-6, similar to SD VAE) because
-   driving images have very high entropy and KL would otherwise dominate.
+   ``N(0, I)``. The reduction can either match the original implementation
+   (sum over latent elements, average over batch) or average over all latent
+   elements for easier comparisons across different bottleneck sizes.
 
 3. **Logvar regulariser** (optional): a tiny L2 on ``logvar`` itself to
    stabilise the early phase where the posterior would otherwise prefer
@@ -35,7 +35,9 @@ class VAELossConfig:
     rec_weight: float = 1.0
     rec_kind: str = "l1"          # 'l1' | 'l2' | 'huber'
     kl_weight: float = 1.0e-6     # SD VAE-ish; raise for stronger regularisation
+    kl_reduction: str = "batch"   # 'batch' | 'mean'
     perceptual_weight: float = 0.0  # set >0 to enable LPIPS (requires lpips pkg)
+    perceptual_batch_size: int = 4  # LPIPS chunk size over flattened frames/views
     logvar_reg_weight: float = 0.0  # 1e-4 if you see logvar -> -inf
     kl_warmup_steps: int = 0      # linearly ramp KL from 0 to full weight
 
@@ -79,23 +81,33 @@ class VAELoss(nn.Module):
 
     def _perceptual(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # LPIPS expects 4D [N, 3, H, W] in [-1, 1].
-        # ``pred`` and ``target`` are ``[B, T, V, C, H, W]`` in [-1, 1].
-        if self.lpips is None or pred.shape[3] != 3:
+        # Flatten all leading dims, e.g. [B,T,V,C,H,W] -> [B*T*V,C,H,W].
+        if self.lpips is None or pred.ndim < 4 or pred.shape[-3] != 3:
             return pred.new_zeros(())
-        flat_pred = pred.flatten(0, 2)
-        flat_target = target.flatten(0, 2)
-        # LPIPS internally returns per-sample scalar; mean over batch.
-        return self.lpips(flat_pred, flat_target).mean()
+        flat_pred = pred.reshape(-1, *pred.shape[-3:]).float()
+        flat_target = target.reshape(-1, *target.shape[-3:]).float()
+        chunk = max(int(self.cfg.perceptual_batch_size), 1)
+        total = flat_pred.new_zeros(())
+        count = 0
+        for start in range(0, flat_pred.shape[0], chunk):
+            end = min(start + chunk, flat_pred.shape[0])
+            score = self.lpips(flat_pred[start:end], flat_target[start:end])
+            total = total + score.sum()
+            count += score.numel()
+        return total / max(count, 1)
 
     def _kl(self, posterior) -> torch.Tensor:
-        # ``posterior.kl()`` in this codebase returns a *sum* over all
-        # latent elements (B, T, V, C, H, W). Normalise by batch so the
-        # absolute value doesn't depend on resolution / sequence length.
+        # ``posterior.kl()`` in this codebase returns a single scalar summed
+        # over every latent element. Keep the old batch-normalised behavior
+        # for compatibility, but allow per-element KL when comparing different
+        # temporal/view/spatial compression settings.
         kl = posterior.kl()
-        # Recover the leading batch dimension. ``posterior.mean`` has the
-        # same shape, take its size(0) as B.
-        b = posterior.mean.shape[0]
-        return kl / max(b, 1)
+        reduction = self.cfg.kl_reduction
+        if reduction == "batch":
+            return kl / max(posterior.mean.shape[0], 1)
+        if reduction == "mean":
+            return kl / max(posterior.mean.numel(), 1)
+        raise ValueError(f"Unknown kl_reduction={reduction}")
 
     def _kl_weight(self) -> float:
         if self.cfg.kl_warmup_steps <= 0:

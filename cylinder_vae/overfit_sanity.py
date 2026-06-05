@@ -1,4 +1,4 @@
-"""5-minute sanity check: can the VAE overfit a single batch?
+﻿"""5-minute sanity check: can the VAE overfit a single batch?
 
 Procedure:
 1. Pull one batch from the synthetic dataset.
@@ -12,7 +12,7 @@ training.
 
 Usage::
 
-    python -m zhw_vae_510.overfit_sanity --steps 500
+    python -m step_1.overfit_sanity --steps 500
 """
 from __future__ import annotations
 
@@ -29,8 +29,12 @@ import torchvision.utils as vutils
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from zhw_vae_510.crossview_vae import CrossView4DVAE  # noqa: E402
-from zhw_vae_510.data import SyntheticCylinderDataset, SyntheticConfig  # noqa: E402
+try:
+    from .crossview_vae import CrossView4DVAE  # noqa: E402
+    from .data import SyntheticCylinderDataset, SyntheticConfig  # noqa: E402
+except ImportError:
+    from crossview_vae import CrossView4DVAE  # noqa: E402
+    from data import SyntheticCylinderDataset, SyntheticConfig  # noqa: E402
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
@@ -58,7 +62,7 @@ def main():
     ap.add_argument("--sample-posterior", action="store_true",
                     help="Use posterior.sample() instead of deterministic "
                          "posterior.mode(). Keep off for wiring debug.")
-    ap.add_argument("--out", default="zhw_vae_510/runs/overfit")
+    ap.add_argument("--out", default="cylinder_vae/runs/overfit")
     ap.add_argument("--use-camera-params", action="store_true")
     args = ap.parse_args()
 
@@ -111,6 +115,8 @@ def main():
         temporal_downsample_factor=args.temporal_downsample_factor,
         temporal_pre=args.temporal_pre,
         spatial_downsample_factor=8,
+        ego_coordinate_mode="synthetic",
+        decode_camera_from_cylinder=args.use_camera_params,
     ).to(device)
 
     n = sum(p.numel() for p in model.parameters())
@@ -130,11 +136,14 @@ def main():
 
     for step in range(1, args.steps + 1):
         optim.zero_grad(set_to_none=True)
-        posterior = model.encode(
-            x, intrinsics=K_in, extrinsics=E_in, intrinsics_hw=intr_hw,
-        ).latent_dist
-        z = posterior.sample() if args.sample_posterior else posterior.mode()
-        recon = model.decode(z).sample
+        output = model(
+            x,
+            sample_posterior=args.sample_posterior,
+            intrinsics=K_in,
+            extrinsics=E_in,
+            intrinsics_hw=intr_hw,
+        )
+        recon = output["sample"]
         if recon.shape != x.shape:
             raise RuntimeError(
                 "VAE reconstruction shape does not match input: "
@@ -150,8 +159,13 @@ def main():
         if step % 20 == 0 or step == 1:
             with torch.no_grad():
                 model.eval()
-                z_m = posterior.mode()
-                recon_m = model.decode(z_m).sample
+                recon_m = model(
+                    x,
+                    sample_posterior=False,
+                    intrinsics=K_in,
+                    extrinsics=E_in,
+                    intrinsics_hw=intr_hw,
+                )["sample"]
                 p = psnr(recon_m, x)
                 model.train()
             if first_psnr is None:
@@ -165,8 +179,13 @@ def main():
     # 4) final check + dump preview
     with torch.no_grad():
         model.eval()
-        z_m = posterior.mode()
-        recon_m = model.decode(z_m).sample
+        recon_m = model(
+            x,
+            sample_posterior=False,
+            intrinsics=K_in,
+            extrinsics=E_in,
+            intrinsics_hw=intr_hw,
+        )["sample"]
         final_psnr = psnr(recon_m, x)
         # Save first-frame side-by-side for V=6 views.
         v_keep = min(x.shape[2], 6)

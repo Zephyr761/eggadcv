@@ -1,6 +1,6 @@
-# zhw_vae_510: Cross-view 4D VAE
+﻿# step_1: Cross-view 4D VAE
 
-`zhw_vae_510` 是一个独立的 cross-view 4D VAE 训练目录，只训练 VAE，不接 CTSD 主视频生成链路。默认输入是多帧多视角连续视频：
+`step_1` 是一个独立的 cross-view 4D VAE 训练目录，只训练 VAE，不接 CTSD 主视频生成链路。默认输入是多帧多视角连续视频：
 
 ```text
 vae_images: [B, T, V, 3, H, W]
@@ -12,7 +12,7 @@ range: [-1, 1]
 产物默认写到：
 
 ```text
-zhw_vae_510/runs/
+step_1/runs/
 ```
 
 ## 文件说明
@@ -93,7 +93,25 @@ projector 有两条路径：
 
 投影发生在 stem 后的 feature map 上，而不是 RGB 上，这样显存和计算更可控。`cylinder_radii` 默认 `[10.0]`，可以传多个半径做 multi-depth 聚合。
 
-重要：真实 nus/nuScenes 训练建议先不加 `--use-camera-params`。当 fallback 路径能稳定下降后，再打开几何 projector；如果打开后 loss 不降，优先查 K/E、相机顺序、坐标系和 `intrinsics_hw`。
+重要：真实 nus/nuScenes 训练如果打开 `--use-camera-params`，脚本会自动使用
+完整闭环路径：encoder 把输入投到 canonical cylinder，decoder 先生成 canonical
+cylinder，再反投影回物理相机图并和原图算 loss。旧的
+`--decode-camera-from-cylinder` 参数已经合并进 `--use-camera-params`，不需要再手动传。
+
+坐标系默认用 nuScenes/AV 约定：
+
+```text
+ego_coordinate_mode = nuscenes
+ground plane = x/y
+up axis = z
+camera convention = OpenCV, +z forward
+```
+
+synthetic 数据如果要测试相机参数路径，需要显式用：
+
+```text
+--ego-coordinate-mode synthetic
+```
 
 ### Downsample Encoder
 
@@ -333,19 +351,19 @@ PY
 
 ```bash
 python -m py_compile \
-  zhw_vae_510/train_vae.py \
-  zhw_vae_510/data.py \
-  zhw_vae_510/crossview_vae.py \
-  zhw_vae_510/losses.py \
-  zhw_vae_510/overfit_sanity.py \
-  zhw_vae_510/visual_debug.py \
-  zhw_vae_510/plot_training.py
+  step_1/train_vae.py \
+  step_1/data.py \
+  step_1/crossview_vae.py \
+  step_1/losses.py \
+  step_1/overfit_sanity.py \
+  step_1/visual_debug.py \
+  step_1/plot_training.py
 ```
 
 最小 synthetic train smoke：
 
 ```bash
-python -m zhw_vae_510.train_vae \
+python -m step_1.train_vae \
   --data synthetic \
   --steps 2 \
   --image-hw 16 32 \
@@ -360,13 +378,13 @@ python -m zhw_vae_510.train_vae \
   --log-every 1 \
   --preview-every 2 \
   --ckpt-every 2 \
-  --out zhw_vae_510/runs/smoke_synthetic
+  --out step_1/runs/smoke_synthetic
 ```
 
 Deterministic overfit sanity：
 
 ```bash
-python -m zhw_vae_510.overfit_sanity \
+python -m step_1.overfit_sanity \
   --steps 500 \
   --lr 5e-4 \
   --image-hw 32 64 \
@@ -374,7 +392,7 @@ python -m zhw_vae_510.overfit_sanity \
   --latent-view-count 4 \
   --latent-channels 8 \
   --base-channels 32 \
-  --out zhw_vae_510/runs/overfit
+  --out step_1/runs/overfit
 ```
 
 如果 `rec_l1` 不降，先不要上真实 nus 数据。
@@ -414,7 +432,7 @@ python -m zhw_vae_510.overfit_sanity \
 单卡 smoke：
 
 ```bash
-python -m zhw_vae_510.train_vae \
+python -m step_1.train_vae \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
@@ -424,19 +442,47 @@ python -m zhw_vae_510.train_vae \
   --num-workers 0 \
   --base-channels 32 \
   --latent-channels 8 \
+  --virtual-view-count 8 \
   --latent-view-count 6 \
   --steps 20 \
   --log-every 1 \
   --preview-every 10 \
   --ckpt-every 20 \
   --amp bf16 \
-  --out zhw_vae_510/runs/nusc_scene_smoke
+  --out step_1/runs/nusc_scene_smoke
 ```
+
+固定单样本 overfit debug：
+
+```bash
+python -m step_1.train_vae \
+  --data nuscenes_scene \
+  --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
+  --nusc-split train \
+  --sequence-length 5 \
+  --image-hw 256 448 \
+  --batch-size 1 \
+  --num-workers 0 \
+  --overfit-samples 1 \
+  --overfit-sample-index 0 \
+  --base-channels 32 \
+  --latent-channels 8 \
+  --latent-view-count 6 \
+  --steps 3000 \
+  --lr 5e-4 \
+  --log-every 10 \
+  --preview-every 100 \
+  --ckpt-every 100 \
+  --amp bf16 \
+  --out step_1/runs/nus_single_sample_overfit
+```
+
+这条命令和普通 train split 训练不一样：它会反复训练 dataset index 0 这一个 clip，并关闭 shuffle。判断 wiring 时先看这个 run；如果单样本 3000 step 仍然明显灰、糊、色彩不上来，再继续查模型瓶颈和 decoder，而不是先怀疑数据规模或训练步数。
 
 正式单卡训练：
 
 ```bash
-python -m zhw_vae_510.train_vae \
+python -m step_1.train_vae \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
@@ -455,13 +501,13 @@ python -m zhw_vae_510.train_vae \
   --preview-every 200 \
   --ckpt-every 500 \
   --amp bf16 \
-  --out zhw_vae_510/runs/nusc_scene_vae_det
+  --out step_1/runs/nusc_scene_vae_det
 ```
 
 多卡 DDP：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 -m zhw_vae_510.train_vae \
+torchrun --standalone --nproc_per_node=4 -m step_1.train_vae \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
@@ -480,13 +526,13 @@ torchrun --standalone --nproc_per_node=4 -m zhw_vae_510.train_vae \
   --preview-every 200 \
   --ckpt-every 500 \
   --amp bf16 \
-  --out zhw_vae_510/runs/nusc_scene_vae_ddp
+  --out step_1/runs/nusc_scene_vae_ddp
 ```
 
 建议第一轮不加 `--use-camera-params`。当 recon 能下降后，再对比：
 
 ```bash
-python -m zhw_vae_510.train_vae \
+python -m step_1.train_vae \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
@@ -500,10 +546,37 @@ python -m zhw_vae_510.train_vae \
   --steps 50000 \
   --use-camera-params \
   --amp bf16 \
-  --out zhw_vae_510/runs/nusc_scene_vae_geom
+  --out step_1/runs/nusc_scene_vae_geom
 ```
 
 如果加 `--use-camera-params` 后不降，先跑 visual debug 检查 projector。
+
+闭环 cylinder 训练，即 encoder 投到 cylinder、decoder 先生成 cylinder、再反投影回真实相机图算 loss：
+
+```bash
+python -m step_1.train_vae \
+  --data nuscenes_scene \
+  --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
+  --nusc-split train \
+  --sequence-length 5 \
+  --image-hw 256 448 \
+  --batch-size 1 \
+  --num-workers 0 \
+  --overfit-samples 1 \
+  --overfit-sample-index 0 \
+  --base-channels 32 \
+  --latent-channels 8 \
+  --latent-view-count 6 \
+  --use-camera-params \
+  --ego-coordinate-mode nuscenes \
+  --steps 3000 \
+  --lr 5e-4 \
+  --log-every 10 \
+  --preview-every 100 \
+  --ckpt-every 100 \
+  --amp bf16 \
+  --out step_1/runs/nus_cylinder_closed_loop_overfit
+```
 
 ### 2. 官方 nuScenes 表格式数据
 
@@ -530,7 +603,7 @@ python -m zhw_vae_510.train_vae \
 训练命令：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 -m zhw_vae_510.train_vae \
+torchrun --standalone --nproc_per_node=4 -m step_1.train_vae \
   --data nus \
   --nusc-data-root /inspire/hdd/.../dataset/nuscenes \
   --nusc-cache-root /inspire/hdd/.../dataset/nus_cache \
@@ -547,7 +620,7 @@ torchrun --standalone --nproc_per_node=4 -m zhw_vae_510.train_vae \
   --latent-view-count 6 \
   --steps 50000 \
   --amp bf16 \
-  --out zhw_vae_510/runs/nus_official_vae
+  --out step_1/runs/nus_official_vae
 ```
 
 `--data nus` 是 `--data nuscenes` 的别名。
@@ -589,24 +662,10 @@ dataset __getitem__ 最好返回单条 clip: [T,V,C,H,W]
 
 `visual_debug.py` 用一次 forward 生成图片、JSON 和 Markdown 报告。
 
-### Synthetic fallback projector
+检查闭环 projector / renderer：
 
 ```bash
-python -m zhw_vae_510.visual_debug \
-  --data synthetic \
-  --image-hw 32 64 \
-  --view-count 4 \
-  --sequence-length 5 \
-  --base-channels 16 \
-  --latent-channels 8 \
-  --out zhw_vae_510/runs/visual_debug_synth \
-  --device cuda
-```
-
-### nus scene-folder
-
-```bash
-python -m zhw_vae_510.visual_debug \
+python -m step_1.visual_debug \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
@@ -616,31 +675,81 @@ python -m zhw_vae_510.visual_debug \
   --base-channels 32 \
   --latent-channels 8 \
   --latent-view-count 6 \
-  --out zhw_vae_510/runs/visual_debug_nus \
+  --use-camera-params \
+  --ego-coordinate-mode nuscenes \
+  --out step_1/runs/visual_debug_cylinder_closed_loop \
+  --device cuda
+```
+
+这里 `virtual_view_count` 不再必须等于输入相机数。它代表 canonical cylinder 的离散视角数；
+`latent_view_count` 才是压缩后的隐空间视角数。比如 6 个真实相机可以先投成 8 或 12 个
+canonical cylinder views，再压成 3 或 4 个 latent views。
+
+重点看：
+
+```text
+projector/camera_projected_rgb.png
+projector/fallback_projected_rgb.png
+projector/camera_vs_fallback_absdiff.png
+projector/camera_coverage.png
+projector/camera_source_camera_rgb.png
+reconstruction/cylinder_recon_grid.png
+reconstruction/recon_grid.png
+debug_metrics.json -> projector -> camera_geometry
+```
+
+### Synthetic fallback projector
+
+```bash
+python -m step_1.visual_debug \
+  --data synthetic \
+  --image-hw 32 64 \
+  --view-count 4 \
+  --sequence-length 5 \
+  --base-channels 16 \
+  --latent-channels 8 \
+  --out step_1/runs/visual_debug_synth \
+  --device cuda
+```
+
+### nus scene-folder
+
+```bash
+python -m step_1.visual_debug \
+  --data nuscenes_scene \
+  --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
+  --nusc-split train \
+  --sample-index 0 \
+  --sequence-length 5 \
+  --image-hw 256 448 \
+  --base-channels 32 \
+  --latent-channels 8 \
+  --latent-view-count 6 \
+  --out step_1/runs/visual_debug_nus \
   --device cuda
 ```
 
 ### 检查 checkpoint
 
 ```bash
-python -m zhw_vae_510.visual_debug \
+python -m step_1.visual_debug \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
-  --checkpoint zhw_vae_510/runs/nusc_scene_vae_det/ckpts/last.pt \
+  --checkpoint step_1/runs/nusc_scene_vae_det/ckpts/last.pt \
   --sequence-length 5 \
   --image-hw 256 448 \
   --base-channels 64 \
   --latent-channels 8 \
   --latent-view-count 6 \
-  --out zhw_vae_510/runs/visual_debug_ckpt \
+  --out step_1/runs/visual_debug_ckpt \
   --device cuda
 ```
 
 ### 检查 geometry projector
 
 ```bash
-python -m zhw_vae_510.visual_debug \
+python -m step_1.visual_debug \
   --data nuscenes_scene \
   --nusc-data-root /shareNFS_40/sharedata/nuscenes/nuscenes_trainval \
   --nusc-split train \
@@ -650,7 +759,7 @@ python -m zhw_vae_510.visual_debug \
   --base-channels 32 \
   --latent-channels 8 \
   --latent-view-count 6 \
-  --out zhw_vae_510/runs/visual_debug_geom \
+  --out step_1/runs/visual_debug_geom \
   --device cuda
 ```
 
@@ -774,22 +883,22 @@ debug_metrics.json -> rope
 文本摘要：
 
 ```bash
-python -m zhw_vae_510.plot_training \
-  --run zhw_vae_510/runs/nusc_scene_vae_det \
+python -m step_1.plot_training \
+  --run step_1/runs/nusc_scene_vae_det \
   --text-only
 ```
 
 生成 SVG：
 
 ```bash
-python -m zhw_vae_510.plot_training \
-  --run zhw_vae_510/runs/nusc_scene_vae_det
+python -m step_1.plot_training \
+  --run step_1/runs/nusc_scene_vae_det
 ```
 
 输出：
 
 ```text
-zhw_vae_510/runs/nusc_scene_vae_det/training_curves.svg
+step_1/runs/nusc_scene_vae_det/training_curves.svg
 ```
 
 ## 常见排查顺序
@@ -807,13 +916,13 @@ zhw_vae_510/runs/nusc_scene_vae_det/training_curves.svg
 在本地已检查：
 
 ```text
-ruff check zhw_vae_510: pass
+ruff check step_1: pass
 py_compile core scripts: pass
-python -m zhw_vae_510.data: pass
-python -m zhw_vae_510.overfit_sanity --steps 1: pass
-python -m zhw_vae_510.train_vae --steps 1 synthetic: pass
-python -m zhw_vae_510.visual_debug synthetic: pass
-python -m zhw_vae_510.plot_training --text-only: pass
+python -m step_1.data: pass
+python -m step_1.overfit_sanity --steps 1: pass
+python -m step_1.train_vae --steps 1 synthetic: pass
+python -m step_1.visual_debug synthetic: pass
+python -m step_1.plot_training --text-only: pass
 ```
 
 Windows 本地如果遇到 OpenMP runtime 冲突，可临时：

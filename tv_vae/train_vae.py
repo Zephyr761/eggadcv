@@ -1,28 +1,11 @@
-"""Standalone training entry point for ``CrossView4DVAE``.
+"""Train the camera-domain TV VAE.
 
-Designed to be lean: pure PyTorch, no Lightning / Accelerate, so the bug
-surface is small and debugging is straightforward. All the moving parts
-(model, data, loss) are imported from this folder.
+This script is intentionally smaller than the old cylinder pipeline.  It is
+for ablations on the bottleneck:
 
-Usage examples
---------------
-
-# Synthetic data, single GPU, default config (good for first sanity-train).
-python -m zhw_vae_510.train_vae --data synthetic --steps 2000 --image-hw 64 128
-
-# Multi-GPU DDP. Per-rank batch size is still --batch-size.
-torchrun --nproc_per_node=4 -m zhw_vae_510.train_vae --data synthetic \
-    --steps 2000 --image-hw 64 128 --batch-size 2
-
-# Real nuPlan data (paths must match those in dwm.tools.dataset_nus).
-python -m zhw_vae_510.train_vae --data nuplan --steps 50000 --image-hw 256 448 \
-    --batch-size 1 --base-channels 64
-
-# Resume from a checkpoint.
-python -m zhw_vae_510.train_vae --data nuplan --resume zhw_vae_510/runs/last.pt
-
-The script intentionally writes nothing outside ``zhw_vae_510/`` so it's safe
-to run repeatedly.
+- joint: per-spatial-column cross-attention over time and scene tokens.
+- non_joint: separable time/scene pooling with the same token budget, without
+  joint attention.
 """
 from __future__ import annotations
 
@@ -35,138 +18,105 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torchvision.utils as vutils
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-# Make ``dwm`` importable for the dataset adapters that pull in
-# dwm.datasets.nuscenes / nuplan.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# The VAE model itself lives next to this script.
-from zhw_vae_510.crossview_vae import CrossView4DVAE  # noqa: E402
-from zhw_vae_510.data import (  # noqa: E402
-    MultiViewVAEAdapter,
-    SyntheticCylinderDataset,
-    SyntheticConfig,
-    make_nuscenes_base,
-    make_nuscenes_scene_folder_base,
-    vae_collate,
-)
-from zhw_vae_510.losses import VAELoss, VAELossConfig  # noqa: E402
+try:
+    from .data import (  # noqa: E402
+        MultiViewVAEAdapter,
+        SyntheticConfig,
+        SyntheticCylinderDataset,
+        make_nuscenes_base,
+        make_nuscenes_scene_folder_base,
+        vae_collate,
+    )
+    from .losses import VAELoss, VAELossConfig  # noqa: E402
+    from .model import TVVAE  # noqa: E402
+except ImportError:  # pragma: no cover
+    from data import (  # noqa: E402
+        MultiViewVAEAdapter,
+        SyntheticConfig,
+        SyntheticCylinderDataset,
+        make_nuscenes_base,
+        make_nuscenes_scene_folder_base,
+        vae_collate,
+    )
+    from losses import VAELoss, VAELossConfig  # noqa: E402
+    from model import TVVAE  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--data", choices=["synthetic", "nuplan", "nus", "nuscenes", "nuscenes_scene"],
-                   default="synthetic", help="Dataset source.")
-    p.add_argument("--out", default="zhw_vae_510/runs",
-                   help="Where to save checkpoints / previews / logs.")
-    p.add_argument("--resume", default="",
-                   help="Path to a checkpoint .pt to resume from.")
+                   default="synthetic")
+    p.add_argument("--out", default="tv_vae/runs")
+    p.add_argument("--resume", default="")
 
-    # data
     p.add_argument("--image-hw", type=int, nargs=2, default=[64, 128])
-    p.add_argument("--sequence-length", type=int, default=5,
-                   help="Must satisfy T = temporal_pre + k * tdf.")
-    p.add_argument("--view-count", type=int, default=6,
-                   help="Number of input cameras (used by synthetic; nuScenes / "
-                        "nuPlan are read straight from the underlying dataset).")
+    p.add_argument("--sequence-length", type=int, default=5)
+    p.add_argument("--view-count", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--overfit-samples", type=int, default=0)
+    p.add_argument("--overfit-sample-index", type=int, default=0)
 
-    # nuScenes-specific paths
-    p.add_argument("--nusc-data-root", default="",
-                   help="(nuScenes) directory holding the extracted blobs / "
-                        "metadata json. Required when --data=nuscenes.")
-    p.add_argument("--nusc-cache-root", default="",
-                   help="(nuScenes) optional pre-generated image cache dir.")
-    p.add_argument("--nusc-dataset-name", default="v1.0-trainval",
-                   help="(nuScenes) metadata sub-directory; e.g. "
-                        "'v1.0-trainval' or 'interp_12Hz_trainval'.")
-    p.add_argument("--nusc-split", default="train",
-                   help="(nuScenes) split: train / val / mini_train / mini_val.")
+    p.add_argument("--nusc-data-root", default="")
+    p.add_argument("--nusc-cache-root", default="")
+    p.add_argument("--nusc-dataset-name", default="v1.0-trainval")
+    p.add_argument("--nusc-split", default="train")
     p.add_argument("--nusc-fps", type=int, default=2)
     p.add_argument("--nusc-stride", type=float, default=0.5)
     p.add_argument("--nusc-keyframe-only", action="store_true", default=True)
 
-    # model (mirrors CrossView4DVAE config keys)
-    p.add_argument("--base-channels", type=int, default=32)
-    p.add_argument("--latent-channels", type=int, default=4)
-    p.add_argument("--virtual-view-count", type=int, default=-1,
-                   help="Number of virtual cameras the cylinder projects to. "
-                        "Defaults to -1 which means 'match the input view "
-                        "count'. Pass an explicit value (e.g. 4) ONLY if "
-                        "you know how to provide a target with that many "
-                        "views (e.g. by pre-projecting GT yourself).")
-    p.add_argument("--latent-view-count", type=int, default=3,
-                   help="Number of latent views (V_lat). Must be "
-                        "<= virtual_view_count. 3 covers 360deg in three "
-                        "120deg sectors which keeps decent horizontal "
-                        "angular resolution while still halving the view "
-                        "dim of a 6-camera ring.")
-    p.add_argument("--num-attention-heads", type=int, default=2)
-    p.add_argument("--num-bottleneck-blocks", type=int, default=1)
-    p.add_argument("--temporal-downsample-factor", type=int, default=4)
-    p.add_argument("--temporal-pre", type=int, default=1)
-    p.add_argument("--spatial-downsample-factor", type=int, default=8)
-    p.add_argument("--cylinder-radii", type=float, nargs="+", default=[10.0])
+    p.add_argument("--base-channels", type=int, default=48)
+    p.add_argument("--latent-channels", type=int, default=32)
+    p.add_argument("--latent-time-count", type=int, default=2)
+    p.add_argument("--scene-token-count", type=int, default=8)
+    p.add_argument("--latent-scene-token-count", type=int, default=4)
+    p.add_argument("--spatial-downsample-factor", type=int, default=4)
+    p.add_argument("--num-attention-heads", type=int, default=4)
+    p.add_argument("--tv-compression", choices=["joint", "non_joint"],
+                   default="joint")
 
-    # loss
     p.add_argument("--rec-kind", default="l1", choices=["l1", "l2", "huber"])
     p.add_argument("--kl-weight", type=float, default=1e-6)
+    p.add_argument("--kl-reduction", choices=["batch", "mean"], default="mean")
     p.add_argument("--kl-warmup", type=int, default=2000)
-    p.add_argument("--perceptual-weight", type=float, default=0.0,
-                   help="Set >0 to enable LPIPS (requires `pip install lpips`).")
-    p.add_argument("--logvar-reg-weight", type=float, default=0.0,
-                   help="Tiny L2 penalty on posterior logvar, e.g. 1e-4.")
-    p.add_argument("--sample-posterior", action="store_true",
-                   help="Sample z from the posterior during training. By "
-                        "default training uses posterior.mode() for a "
-                        "deterministic reconstruction sanity path.")
+    p.add_argument("--perceptual-weight", type=float, default=0.0)
+    p.add_argument("--perceptual-batch-size", type=int, default=4)
+    p.add_argument("--edge-loss-weight", type=float, default=0.0)
+    p.add_argument("--logvar-reg-weight", type=float, default=0.0)
+    p.add_argument("--sample-posterior", action="store_true")
 
-    # optim / sched
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--warmup-steps", type=int, default=200)
 
-    # mixed precision
     p.add_argument("--amp", choices=["none", "fp16", "bf16"], default="bf16")
-    p.add_argument("--ddp-backend", default="",
-                   help="Distributed backend. Empty means nccl on CUDA, else gloo.")
-    p.add_argument("--find-unused-parameters", action="store_true",
-                   help="Pass find_unused_parameters=True to DDP.")
+    p.add_argument("--ddp-backend", default="")
+    p.add_argument("--find-unused-parameters", action="store_true")
     p.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int,
                    default=int(os.environ.get("LOCAL_RANK", "0")),
                    help=argparse.SUPPRESS)
 
-    # logging
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--preview-every", type=int, default=200)
     p.add_argument("--ckpt-every", type=int, default=1000)
-    p.add_argument("--use-camera-params", action="store_true",
-                   help="Pass intrinsics/extrinsics to encode() (geometry-aware "
-                        "projection). Otherwise the VAE uses its fallback.")
-    p.add_argument("--gradient-checkpoint", action="store_true",
-                   help="CrossView4DVAE: checkpoint encode+decode (less VRAM, slower).")
     return p
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def device_of() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def init_distributed(args):
-    """Initialize torch.distributed when launched by torchrun."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     if not distributed:
@@ -178,20 +128,18 @@ def init_distributed(args):
             "device": device_of(),
         }
 
-    rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
-        backend = args.ddp_backend or ("gloo" if os.name == "nt" else "nccl")
+        backend = args.ddp_backend or "nccl"
     else:
         device = torch.device("cpu")
         backend = args.ddp_backend or "gloo"
-
     dist.init_process_group(backend=backend)
     return {
         "distributed": True,
-        "rank": rank,
+        "rank": dist.get_rank(),
         "local_rank": local_rank,
         "world_size": world_size,
         "device": device,
@@ -199,7 +147,7 @@ def init_distributed(args):
 
 
 def is_main_process(ddp_info) -> bool:
-    return ddp_info["rank"] == 0
+    return int(ddp_info.get("rank", 0)) == 0
 
 
 def rank0_print(ddp_info, *args, **kwargs):
@@ -214,18 +162,6 @@ def cleanup_distributed(ddp_info):
 
 def amp_dtype(name: str):
     return {"none": None, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
-
-
-def validate_temporal_config(args):
-    delta = args.sequence_length - args.temporal_pre
-    if delta < 0 or delta % args.temporal_downsample_factor != 0:
-        raise ValueError(
-            "Invalid sequence_length for this VAE temporal stride: "
-            f"sequence_length={args.sequence_length}, "
-            f"temporal_pre={args.temporal_pre}, "
-            f"temporal_downsample_factor={args.temporal_downsample_factor}. "
-            "Expected T = temporal_pre + k * temporal_downsample_factor."
-        )
 
 
 def lr_lambda(step: int, warmup: int) -> float:
@@ -248,7 +184,7 @@ def make_dataset(args, ddp_info=None):
 
     if args.data in ("nus", "nuscenes"):
         if not args.nusc_data_root:
-            raise ValueError("--nusc-data-root is required when --data=nus/nuscenes")
+            raise ValueError("--nusc-data-root is required for nuScenes.")
         base = make_nuscenes_base(
             data_root=args.nusc_data_root,
             cache_root=args.nusc_cache_root or None,
@@ -262,14 +198,14 @@ def make_dataset(args, ddp_info=None):
         if ddp_info is None or is_main_process(ddp_info):
             print(f"[data] nuScenes: {len(base)} clips "
                   f"(dataset_name={args.nusc_dataset_name}, split={args.nusc_split}, "
-                  f"fps={args.nusc_fps}, T={args.sequence_length})")
+                  f"T={args.sequence_length})")
         return MultiViewVAEAdapter(
             base, sequence_length=args.sequence_length,
             image_hw=tuple(args.image_hw))
 
     if args.data == "nuscenes_scene":
         if not args.nusc_data_root:
-            raise ValueError("--nusc-data-root is required when --data=nuscenes_scene")
+            raise ValueError("--nusc-data-root is required for nuscenes_scene.")
         base = make_nuscenes_scene_folder_base(
             data_root=args.nusc_data_root,
             split=args.nusc_split,
@@ -283,7 +219,6 @@ def make_dataset(args, ddp_info=None):
             base, sequence_length=args.sequence_length,
             image_hw=tuple(args.image_hw))
 
-    # nuplan: import locally so synthetic runs have no nuplan deps.
     from dwm.tools.dataset_nus import make_base_ds
     base = make_base_ds(train=True)
     return MultiViewVAEAdapter(
@@ -291,15 +226,30 @@ def make_dataset(args, ddp_info=None):
         image_hw=tuple(args.image_hw))
 
 
-def save_preview(images: torch.Tensor, recon: torch.Tensor,
-                 path: str, max_views: int = 6):
-    """Save a side-by-side grid of first-frame views: GT row over recon row."""
-    # images / recon: [B, T, V, C, H, W] in [-1, 1]
+def maybe_make_overfit_subset(dataset, args, ddp_info):
+    if args.overfit_samples <= 0:
+        return dataset
+    end = args.overfit_sample_index + args.overfit_samples
+    if args.overfit_sample_index < 0 or end > len(dataset):
+        raise ValueError(
+            "Requested overfit subset is outside dataset: "
+            f"start={args.overfit_sample_index}, "
+            f"count={args.overfit_samples}, len={len(dataset)}")
+    indices = list(range(args.overfit_sample_index, end))
+    rank0_print(
+        ddp_info,
+        f"[data] overfit subset enabled: indices {indices[0]}..{indices[-1]} "
+        f"({len(indices)} sample(s)); shuffle disabled")
+    return Subset(dataset, indices)
+
+
+def save_preview(images: torch.Tensor, recon: torch.Tensor, path: str,
+                 max_views: int = 6):
     b, t, v, c, h, w = images.shape
     v_keep = min(v, max_views)
-    gt = images[0, 0, :v_keep].cpu()
-    rc = recon[0, 0, :v_keep].cpu()
-    grid = torch.cat([gt, rc], dim=0)             # 2*V_keep
+    gt = images[0, 0, :v_keep].detach().cpu()
+    rc = recon[0, 0, :v_keep].detach().cpu()
+    grid = torch.cat([gt, rc], dim=0)
     grid = (grid.clamp(-1, 1) + 1) / 2.0
     vutils.save_image(grid, path, nrow=v_keep)
 
@@ -313,11 +263,44 @@ def log_input_probe(ddp_info, sample: dict, out_dir: Path, max_views: int = 6):
     print(
         f"[data] probe vae_images={tuple(imgs.shape)} "
         f"range=[{imgs.min().item():.3f}, {imgs.max().item():.3f}] "
-        f"view_mean=[{means_str}]"
-    )
+        f"view_mean=[{means_str}]")
     v_keep = min(imgs.shape[1], max_views)
     grid = (imgs[0, :v_keep].clamp(-1, 1) + 1) / 2.0
     vutils.save_image(grid, str(out_dir / "input_probe.png"), nrow=v_keep)
+
+
+def reconstruction_loss(pred: torch.Tensor, target: torch.Tensor,
+                        kind: str) -> torch.Tensor:
+    if kind == "l1":
+        return F.l1_loss(pred, target)
+    if kind == "l2":
+        return F.mse_loss(pred, target)
+    if kind == "huber":
+        return F.smooth_l1_loss(pred, target, beta=0.1)
+    raise ValueError(f"Unknown rec_kind={kind}")
+
+
+def gradient_reconstruction_loss(pred: torch.Tensor, target: torch.Tensor):
+    dx_loss = (pred[..., :, 1:] - pred[..., :, :-1] -
+               (target[..., :, 1:] - target[..., :, :-1])).abs()
+    dy_loss = (pred[..., 1:, :] - pred[..., :-1, :] -
+               (target[..., 1:, :] - target[..., :-1, :])).abs()
+    return 0.5 * (dx_loss.mean() + dy_loss.mean())
+
+
+def reduce_metric_dict(metrics: dict, ddp_info) -> dict:
+    reduced = {}
+    for key, value in metrics.items():
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(float(value), device=ddp_info["device"])
+        else:
+            value = value.detach()
+        if ddp_info["distributed"]:
+            value = value.clone()
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+            value /= ddp_info["world_size"]
+        reduced[key] = value
+    return reduced
 
 
 def save_checkpoint(model, optim, scheduler, step, args, path):
@@ -332,13 +315,7 @@ def save_checkpoint(model, optim, scheduler, step, args, path):
     torch.save(payload, path)
 
 
-def append_metrics(path: Path, row: dict):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=True) + "\n")
-
-
 def load_model_state(model, state_dict, strict: bool = False):
-    """Load checkpoints saved with or without a DDP ``module.`` prefix."""
     try:
         return model.load_state_dict(state_dict, strict=strict)
     except RuntimeError:
@@ -348,33 +325,16 @@ def load_model_state(model, state_dict, strict: bool = False):
         raise
 
 
-def reduce_metric_dict(metrics, ddp_info):
-    reduced = {}
-    for k, v in metrics.items():
-        if torch.is_tensor(v):
-            value = v.detach().to(ddp_info["device"])
-        else:
-            value = torch.tensor(float(v), device=ddp_info["device"])
-        if value.ndim != 0:
-            value = value.mean()
-        if ddp_info["distributed"]:
-            value = value.clone()
-            dist.all_reduce(value, op=dist.ReduceOp.SUM)
-            value /= ddp_info["world_size"]
-        reduced[k] = value
-    return reduced
+def append_metrics(path: Path, row: dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     args = build_parser().parse_args()
-    validate_temporal_config(args)
     ddp_info = init_distributed(args)
     try:
         device = ddp_info["device"]
-
         out_dir = Path(args.out)
         preview_dir = out_dir / "previews"
         ckpt_dir = out_dir / "ckpts"
@@ -383,6 +343,8 @@ def main():
             out_dir.mkdir(parents=True, exist_ok=True)
             preview_dir.mkdir(exist_ok=True)
             ckpt_dir.mkdir(exist_ok=True)
+            if not args.resume and metrics_path.exists():
+                metrics_path.unlink()
         if ddp_info["distributed"]:
             if device.type == "cuda":
                 dist.barrier(device_ids=[ddp_info["local_rank"]])
@@ -394,85 +356,81 @@ def main():
             f"[setup] device={device}, amp={args.amp}, "
             f"distributed={ddp_info['distributed']}, "
             f"world_size={ddp_info['world_size']}, "
-            f"posterior={'sample' if args.sample_posterior else 'mode'}"
-        )
+            f"posterior={'sample' if args.sample_posterior else 'mode'}")
 
-        # ------------------------------------------------------------------
-        # Data
-        # ------------------------------------------------------------------
         dataset = make_dataset(args, ddp_info)
+        dataset = maybe_make_overfit_subset(dataset, args, ddp_info)
+        overfit_active = args.overfit_samples > 0
         train_sampler = DistributedSampler(
             dataset,
             num_replicas=ddp_info["world_size"],
             rank=ddp_info["rank"],
-            shuffle=True,
-            drop_last=True,
+            shuffle=not overfit_active,
+            drop_last=not overfit_active,
         ) if ddp_info["distributed"] else None
         loader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=train_sampler is None,
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None and not overfit_active),
             sampler=train_sampler,
-            num_workers=args.num_workers, collate_fn=vae_collate,
-            drop_last=True, pin_memory=device.type == "cuda")
+            num_workers=args.num_workers,
+            collate_fn=vae_collate,
+            drop_last=not overfit_active,
+            pin_memory=device.type == "cuda")
 
-        # Probe one sample to learn V_input. Reconstruction loss requires
-        # ``virtual_view_count == V_input`` so VAE output and GT have matching
-        # view dim.
         probe = dataset[0]
         log_input_probe(ddp_info, probe, out_dir)
         v_input = int(probe["vae_images"].shape[1])
-        if args.virtual_view_count <= 0:
-            args.virtual_view_count = v_input
-            rank0_print(ddp_info, f"[setup] auto virtual_view_count = V_input = {v_input}")
-        elif args.virtual_view_count != v_input:
-            rank0_print(
-                ddp_info,
-                f"[warn] virtual_view_count ({args.virtual_view_count}) != "
-                f"V_input ({v_input}). Reconstruction loss is going to fail "
-                f"unless you pre-project GT yourself. Aborting.")
-            raise SystemExit(1)
-        if args.latent_view_count > args.virtual_view_count:
-            rank0_print(
-                ddp_info,
-                f"[warn] latent_view_count ({args.latent_view_count}) must be "
-                f"<= virtual_view_count ({args.virtual_view_count}). Aborting.")
-            raise SystemExit(1)
+        args.view_count = v_input
+        if args.latent_scene_token_count > args.scene_token_count:
+            raise ValueError(
+                "latent_scene_token_count must be <= scene_token_count.")
+        if args.latent_time_count > args.sequence_length:
+            raise ValueError(
+                f"latent_time_count={args.latent_time_count} > T={args.sequence_length}")
 
-        # Log args after auto-filled values (e.g. virtual_view_count) are resolved.
         if is_main_process(ddp_info):
-            with open(out_dir / "args.json", "w") as f:
+            with open(out_dir / "args.json", "w", encoding="utf-8") as f:
                 json.dump(vars(args), f, indent=2)
-            if not args.resume and metrics_path.exists():
-                metrics_path.unlink()
 
-        # ------------------------------------------------------------------
-        # Model
-        # ------------------------------------------------------------------
-        model = CrossView4DVAE(
+        model = TVVAE(
             base_channels=args.base_channels,
             latent_channels=args.latent_channels,
-            virtual_view_count=args.virtual_view_count,
-            latent_view_count=args.latent_view_count,
-            num_attention_heads=args.num_attention_heads,
-            num_bottleneck_blocks=args.num_bottleneck_blocks,
-            temporal_downsample_factor=args.temporal_downsample_factor,
-            temporal_pre=args.temporal_pre,
+            sequence_length=args.sequence_length,
+            view_count=v_input,
+            scene_token_count=args.scene_token_count,
+            latent_time_count=args.latent_time_count,
+            latent_scene_token_count=args.latent_scene_token_count,
             spatial_downsample_factor=args.spatial_downsample_factor,
-            cylinder_radii=tuple(args.cylinder_radii),
-            gradient_checkpoint_encode=args.gradient_checkpoint,
-            gradient_checkpoint_decode=args.gradient_checkpoint,
+            num_attention_heads=args.num_attention_heads,
+            tv_compression=args.tv_compression,
+            image_height=args.image_hw[0],
+            image_width=args.image_hw[1],
         ).to(device)
 
         n_params = sum(p.numel() for p in model.parameters())
-        rank0_print(ddp_info, f"[model] CrossView4DVAE: {n_params/1e6:.2f}M params")
+        h_lat = (args.image_hw[0] + args.spatial_downsample_factor - 1) // args.spatial_downsample_factor
+        w_lat = (args.image_hw[1] + args.spatial_downsample_factor - 1) // args.spatial_downsample_factor
+        latent_tv_tokens = (
+            args.latent_time_count * args.latent_scene_token_count)
+        latent_tokens = latent_tv_tokens * h_lat * w_lat
+        source_tokens = args.sequence_length * v_input * args.image_hw[0] * args.image_hw[1]
+        rank0_print(
+            ddp_info,
+            f"[model] TVVAE/{args.tv_compression}: {n_params/1e6:.2f}M params, "
+            f"scene_tokens={args.scene_token_count}, "
+            f"latent_TS_tokens={latent_tv_tokens}, "
+            f"latent_tokens={latent_tokens}, "
+            f"raw_TVHW_tokens={source_tokens}, "
+            f"compression={source_tokens / max(latent_tokens, 1):.1f}x")
 
-        # ------------------------------------------------------------------
-        # Loss / optim
-        # ------------------------------------------------------------------
         loss_fn = VAELoss(VAELossConfig(
             rec_kind=args.rec_kind,
             kl_weight=args.kl_weight,
+            kl_reduction=args.kl_reduction,
             kl_warmup_steps=args.kl_warmup,
             perceptual_weight=args.perceptual_weight,
+            perceptual_batch_size=args.perceptual_batch_size,
             logvar_reg_weight=args.logvar_reg_weight,
         )).to(device)
         optim = torch.optim.AdamW(
@@ -481,19 +439,16 @@ def main():
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optim, lambda s: lr_lambda(s, args.warmup_steps))
 
-        # ------------------------------------------------------------------
-        # Resume
-        # ------------------------------------------------------------------
         start_step = 0
         if args.resume and os.path.exists(args.resume):
             rank0_print(ddp_info, f"[resume] loading {args.resume}")
-            ck = torch.load(args.resume, map_location="cpu")
-            load_model_state(model, ck["model"], strict=False)
-            if ck.get("optimizer") is not None:
-                optim.load_state_dict(ck["optimizer"])
-            if ck.get("scheduler") is not None:
-                scheduler.load_state_dict(ck["scheduler"])
-            start_step = ck.get("step", 0)
+            ckpt = torch.load(args.resume, map_location="cpu")
+            load_model_state(model, ckpt["model"], strict=False)
+            if ckpt.get("optimizer") is not None:
+                optim.load_state_dict(ckpt["optimizer"])
+            if ckpt.get("scheduler") is not None:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            start_step = int(ckpt.get("step", 0))
             loss_fn._step = start_step
 
         if ddp_info["distributed"]:
@@ -501,16 +456,13 @@ def main():
                 model,
                 device_ids=[ddp_info["local_rank"]] if device.type == "cuda" else None,
                 output_device=ddp_info["local_rank"] if device.type == "cuda" else None,
-                find_unused_parameters=args.find_unused_parameters,
-            )
+                find_unused_parameters=args.find_unused_parameters)
 
-        # ------------------------------------------------------------------
-        # Train loop
-        # ------------------------------------------------------------------
         autocast_dtype = amp_dtype(args.amp)
         use_amp = autocast_dtype is not None
         scaler = torch.cuda.amp.GradScaler() if (
-            use_amp and autocast_dtype == torch.float16 and device.type == "cuda") else None
+            use_amp and autocast_dtype == torch.float16 and device.type == "cuda"
+        ) else None
 
         model.train()
         step = start_step
@@ -519,8 +471,8 @@ def main():
             train_sampler.set_epoch(epoch)
         iterator = iter(loader)
         log_buf = {}
-
         t_last = time.time()
+
         while step < args.steps:
             try:
                 batch = next(iterator)
@@ -531,19 +483,17 @@ def main():
                 iterator = iter(loader)
                 batch = next(iterator)
 
-            x = batch["vae_images"].to(device, non_blocking=True)  # [B, T, V, 3, H, W]
+            x = batch["vae_images"].to(device, non_blocking=True)
             K = batch.get("camera_intrinsics")
             E = batch.get("camera_transforms")
             intr_hw = batch.get("intrinsics_hw")
-            if args.use_camera_params and K is not None and E is not None:
+            if K is not None and E is not None:
                 K = K.to(device, non_blocking=True)
                 E = E.to(device, non_blocking=True)
             else:
                 K = None
                 E = None
-
             optim.zero_grad(set_to_none=True)
-
             ctx = (
                 torch.autocast(device_type=device.type, dtype=autocast_dtype)
                 if use_amp else torch.enable_grad()
@@ -556,17 +506,40 @@ def main():
                     extrinsics=E,
                     intrinsics_hw=intr_hw,
                 )
-                posterior = output["posterior"]
                 recon = output["sample"]
+                posterior = output["posterior"]
                 if recon.shape != x.shape:
                     raise RuntimeError(
-                        "VAE reconstruction shape does not match input: "
-                        f"recon={tuple(recon.shape)} input={tuple(x.shape)}. "
-                        "Check sequence_length, view counts, and spatial "
-                        "downsample settings."
-                    )
-                metrics = loss_fn(recon, x, posterior)
-                loss = metrics["loss"]
+                        f"recon shape {tuple(recon.shape)} != input {tuple(x.shape)}")
+                rec = reconstruction_loss(recon, x, args.rec_kind)
+                perceptual = loss_fn._perceptual(recon, x)
+                edge = (
+                    gradient_reconstruction_loss(recon, x)
+                    if args.edge_loss_weight > 0 else recon.new_zeros(()))
+                kl = loss_fn._kl(posterior)
+                kl_w = loss_fn._kl_weight()
+                logvar_reg = (
+                    posterior.logvar.pow(2).mean()
+                    if args.logvar_reg_weight > 0 else recon.new_zeros(()))
+                loss = (
+                    rec
+                    + args.perceptual_weight * perceptual
+                    + args.edge_loss_weight * edge
+                    + kl_w * kl
+                    + args.logvar_reg_weight * logvar_reg
+                )
+                loss_fn._step += 1
+                metrics = {
+                    "loss": loss,
+                    "rec": rec.detach(),
+                    "perceptual": perceptual.detach(),
+                    "edge": edge.detach(),
+                    "kl": kl.detach(),
+                    "kl_weight_now": recon.new_tensor(kl_w),
+                    "logvar_reg": logvar_reg.detach(),
+                    "mean_abs_z": posterior.mean.detach().abs().mean(),
+                    "logvar_mean": posterior.logvar.detach().mean(),
+                }
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -581,10 +554,9 @@ def main():
             scheduler.step()
             step += 1
 
-            # ---- logging ----
-            reduced_metrics = reduce_metric_dict(metrics, ddp_info)
-            for k, v in reduced_metrics.items():
-                log_buf.setdefault(k, []).append(float(v.item()) if hasattr(v, "item") else float(v))
+            reduced = reduce_metric_dict(metrics, ddp_info)
+            for key, value in reduced.items():
+                log_buf.setdefault(key, []).append(float(value.item()))
 
             if step % args.log_every == 0:
                 if is_main_process(ddp_info):
@@ -598,6 +570,8 @@ def main():
                         "steps_total": args.steps,
                         "loss": avg["loss"],
                         "rec": avg["rec"],
+                        "perceptual": avg.get("perceptual", 0.0),
+                        "edge": avg.get("edge", 0.0),
                         "kl": avg["kl"],
                         "kl_weight_now": avg["kl_weight_now"],
                         "weighted_kl": avg["kl"] * avg["kl_weight_now"],
@@ -610,26 +584,32 @@ def main():
                     print(
                         f"[step {step:6d}/{args.steps}] "
                         f"loss={avg['loss']:.4f} rec={avg['rec']:.4f} "
-                        f"kl={avg['kl']:.2f} (w={avg['kl_weight_now']:.1e}, "
+                        f"edge={avg.get('edge', 0.0):.4f} "
+                        f"perc={avg.get('perceptual', 0.0):.4f} "
+                        f"kl={avg['kl']:.4f} "
+                        f"(w={avg['kl_weight_now']:.1e}, "
                         f"wkl={avg['kl'] * avg['kl_weight_now']:.4f}) "
-                        f"|z|={avg['mean_abs_z']:.3f} logvar~{avg['logvar_mean']:.2f} "
-                        f"lr={lr_now:.2e}  ({it_s:.1f} it/s)"
-                    )
+                        f"|z|={avg['mean_abs_z']:.3f} "
+                        f"logvar~{avg['logvar_mean']:.2f} "
+                        f"lr={lr_now:.2e} ({it_s:.1f} it/s)")
                 log_buf.clear()
 
-            # ---- preview ----
             if is_main_process(ddp_info) and step % args.preview_every == 0:
                 with torch.no_grad():
                     model.eval()
                     raw_model = model.module if hasattr(model, "module") else model
-                    z_eval = posterior.mode().to(dtype=raw_model.from_latent.weight.dtype)
-                    recon_eval = raw_model.decode(z_eval).sample
+                    preview = raw_model(
+                        x,
+                        sample_posterior=False,
+                        intrinsics=K,
+                        extrinsics=E,
+                        intrinsics_hw=intr_hw,
+                    )["sample"]
                     save_preview(
-                        x.detach(), recon_eval.detach(),
+                        x.detach(), preview.detach(),
                         str(preview_dir / f"step_{step:06d}.png"))
                     model.train()
 
-            # ---- ckpt ----
             if is_main_process(ddp_info) and (
                 step % args.ckpt_every == 0 or step == args.steps
             ):
